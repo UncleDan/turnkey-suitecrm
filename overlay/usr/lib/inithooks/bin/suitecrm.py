@@ -2,22 +2,23 @@
 """Set SuiteCRM admin password
 
 Option:
-    --pass=     unless provided, will ask interactively
-    --domain=   unless provided, will ask interactively
-                DEFAULT=www.example.com
+    --pass=    unless provided, will ask interactively
+    --domain=  unless provided, will ask interactively
+               DEFAULT=www.example.com
 """
 
 import sys
 import getopt
-import bcrypt
+import os
 from hashlib import md5
+import subprocess
 
 from libinithooks.dialog_wrapper import Dialog
 from mysqlconf import MySQL
-import subprocess
 
-DEFAULT_DOMAIN="www.example.com"
-
+DEFAULT_DOMAIN = "www.example.com"
+WEBROOT = "/var/www/suitecrm"
+CONF_FILE = "/etc/apache2/sites-available/suitecrm.conf"
 
 def usage(s=None):
     if s:
@@ -26,6 +27,13 @@ def usage(s=None):
     print(__doc__, file=sys.stderr)
     sys.exit(1)
 
+def is_ssl_enabled():
+    """Checks if SSL is active in the Apache config"""
+    if os.path.exists(CONF_FILE):
+        with open(CONF_FILE, 'r') as f:
+            if "SSLEngine on" in f.read():
+                return True
+    return False
 
 def main():
     try:
@@ -62,39 +70,45 @@ def main():
     if domain == "DEFAULT":
         domain = DEFAULT_DOMAIN
 
-    for conf in ['config.php', 'config_si.php']:
-        conf = f'/var/www/suitecrm/public/legacy/{conf}'
-        with open(conf, 'r') as fob:
-            new_contents = []
-            for line in fob:
-                newline = ''
-                if 'site_url' in line:
-                    _lchar = ''
-                    for char in line:
-                        newline = f"{newline}{char}"
-                        if _lchar == '=' and char == '>':
-                            newline = f"{newline} '{domain}',\n"
-                            break
-                        _lchar = char
-                    if newline:
-                        new_contents.append(newline)
+    # 1. SSL Detection & site_url Construction
+    # Remove any existing protocol if user typed it in
+    domain_clean = domain.replace('http://', '').replace('https://', '').strip('/')
+    protocol = "https" if is_ssl_enabled() else "http"
+    site_url = f"{protocol}://{domain_clean}"
+
+    # 2. Update Legacy Configs
+    for conf_name in ['config.php', 'config_si.php']:
+        conf_path = f'{WEBROOT}/public/legacy/{conf_name}'
+        if not os.path.exists(conf_path):
+            continue
+            
+        with open(conf_path, 'r') as fob:
+            lines = fob.readlines()
+        
+        with open(conf_path, 'w') as fob:
+            for line in lines:
+                if "'site_url'" in line:
+                    fob.write(f"  'site_url' => '{site_url}',\n")
                 else:
-                    new_contents.append(line)
+                    fob.write(line)
 
-        if new_contents:
-            with open(conf, 'w') as fob:
-                fob.writelines(new_contents)
-
-    # For some weird reason SuiteCRM MD5 hashes the password first?!
+    # 3. Update Database Password
+    # SuiteCRM 8 still uses BCRYPT(MD5(password)) for legacy compatibility
     password_md5 = md5(password.encode()).hexdigest()
     hash_pass = subprocess.run([
-        'php', '-r', f'print(password_hash($argv[1], PASSWORD_BCRYPT));',
+        'php', '-r', 'echo password_hash($argv[1], PASSWORD_BCRYPT);',
         password_md5
-    ], capture_output=True).stdout
+    ], capture_output=True, text=True).stdout.strip()
 
     m = MySQL()
-    m.execute('UPDATE suitecrm.users SET user_hash=%s WHERE user_name=\"admin\";', (hash_pass,))
+    m.execute('UPDATE suitecrm.users SET user_hash=%s WHERE user_name="admin";', (hash_pass,))
 
+    # 4. Clear Symfony Cache (Crucial for SuiteCRM 8 routing)
+    # This prevents the 500 error after changing environmental settings
+    subprocess.run(['sudo', '-u', 'www-data', f'{WEBROOT}/bin/console', 'cache:clear', '--no-warmup'], 
+                   cwd=WEBROOT, capture_output=True)
+
+    print(f"SuiteCRM 8 configuration updated for {site_url}")
 
 if __name__ == "__main__":
     main()
