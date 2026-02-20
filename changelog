@@ -1,3 +1,10 @@
+turnkey-suitecrm-18.1 (1) turnkey; urgency=low
+
+  * Install latest upstream version of SuiteCRM: 8.9.2.
+
+  * Special thanks to UncleDan (Daniele Lolli - https://github.com/UncleDan)
+    for starting work on this (and many other appliances).
+
 turnkey-suitecrm-18.0 (1) turnkey; urgency=low
 
   * Install latest upstream version of SuiteCRM: 8.4.0.
