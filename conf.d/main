@@ -1,70 +1,46 @@
 #!/bin/bash -ex
 
-# Variables
 DB_NAME=suitecrm
 DB_USER=suitecrm
 DB_PASS=$(mcookie)
-
 ADMIN_NAME=admin
 ADMIN_PASS=turnkey
-
 SRC=/usr/local/src
 WEBROOT=/var/www/suitecrm
 CONF_FILE=/etc/apache2/sites-available/suitecrm.conf
 
-# 1. Update Apache DocumentRoot to /public (Required for SuiteCRM 8)
+# 1. Update Apache DocumentRoot & Directory to /public
 if [ -f "$CONF_FILE" ]; then
-    # We use -E for extended regex: 
-    # [[:space:]]+ matches one or more spaces/tabs
-    # $ ensures the line ends EXACTLY at $WEBROOT (no /public already there)
     if grep -qE "DocumentRoot[[:space:]]+$WEBROOT$" "$CONF_FILE"; then
-        echo "Validating DocumentRoot: Match found. Updating to $WEBROOT/public..."
-        sed -i "s|DocumentRoot $WEBROOT$|DocumentRoot $WEBROOT/public|" "$CONF_FILE"
-        sed -i "s|<Directory $WEBROOT>|<Directory $WEBROOT/public>|" "$CONF_FILE"
-    else
-        echo "DocumentRoot already points to /public or is custom. Skipping Apache edit."
+        sed -i "s|DocumentRoot $WEBROOT$|DocumentRoot $WEBROOT/public|g" "$CONF_FILE"
+    fi
+    if grep -q "<Directory $WEBROOT/>" "$CONF_FILE"; then
+        sed -i "s|<Directory $WEBROOT/>|<Directory $WEBROOT/public/>|g" "$CONF_FILE"
     fi
 fi
 
-# 2. Configure turnkey-composer
-TKL_COMPOSER=/usr/local/bin/turnkey-composer
-if [ -f "$TKL_COMPOSER" ]; then
-    sed -i "\|^APP_ROOT_FALLBACK|s|=.*|=$WEBROOT|" "$TKL_COMPOSER"
-fi
-
-# 3. Unpack and Prepare
+# 2. Extract & Permissions
 mkdir -p "$WEBROOT"
-# Use a specific glob to ensure we get the right file
-unzip "$SRC"/suitecrm-8.9.2*.zip -d "$WEBROOT" || unzip "$SRC"/suitecrm-*.zip -d "$WEBROOT"
+unzip "$SRC"/suitecrm-*.zip -d "$WEBROOT"
 rm -f "$SRC"/suitecrm-*.zip
 
-# Initial permissions so the CLI installer can write its own config
 find "$WEBROOT" -type d -exec chmod 2755 {} \;
 find "$WEBROOT" -type f -exec chmod 0644 {} \;
 chown -R www-data:www-data "$WEBROOT"
 chmod +x "$WEBROOT/bin/console"
 
-# 4. PHP Environment Tweaks
-# Detects version automatically (e.g., 8.2, 8.3)
+# 3. PHP & DB Setup
 PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
 PHPINI="/etc/php/$PHP_VER/apache2/php.ini"
+sed -i "s|^variables_order.*|variables_order = \"EGPCS\"|" "$PHPINI"
+sed -i "s|^memory_limit.*|memory_limit = 512M|" "$PHPINI"
 
-if [ -f "$PHPINI" ]; then
-    sed -i "s|^variables_order.*|variables_order = \"EGPCS\"|" "$PHPINI"
-    sed -i "s|^;date.timezone.*|date.timezone = \"UTC\"|" "$PHPINI"
-    # SuiteCRM 8 is memory-heavy; 128M often causes 500 errors during metadata caching
-    sed -i "s|^memory_limit.*|memory_limit = 512M|" "$PHPINI"
-fi
-
-# 5. Database Setup
 service mysql start
-mysql --user=root --batch --execute "CREATE DATABASE $DB_NAME; GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS'; FLUSH PRIVILEGES;"
+mysql --user=root -e "CREATE DATABASE $DB_NAME; GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';"
 
-# 6. Run CLI Installer
+# 4. Install (No --unattended)
 cd "$WEBROOT"
-# The -S (site_url) is vital for the routing engine to build internal links
 ./bin/console suitecrm:app:install \
-    --unattended \
     -u "$ADMIN_NAME" \
     -p "$ADMIN_PASS" \
     -U "$DB_USER" \
@@ -74,31 +50,9 @@ cd "$WEBROOT"
     -S "http://localhost" \
     -d "no"
 
-# 7. Post-Installation Fixes (Crucial for 500 Error prevention)
-# Fix the legacy .htaccess RewriteBase (SuiteCRM 8.x known issue)
-if [ -f "$WEBROOT/public/legacy/.htaccess" ]; then
-    sed -i 's|RewriteBase .*|RewriteBase /legacy/|' "$WEBROOT/public/legacy/.htaccess"
-fi
-
-# Final Ownership sweep - installer creates files as root that Apache needs to write to
+# 5. Fix Legacy Path
+sed -i 's|RewriteBase .*|RewriteBase /legacy/|' "$WEBROOT/public/legacy/.htaccess"
 chown -R www-data:www-data "$WEBROOT"
-# Set specific writable permissions for runtime directories
-chmod -R g+rw "$WEBROOT/common/res/labels" "$WEBROOT/public/legacy" "$WEBROOT/cache" "$WEBROOT/logs"
 
-# Blank logs for a fresh start
-echo > "$WEBROOT/logs/install.log"
-[ -d "$WEBROOT/logs/prod" ] && echo > "$WEBROOT/logs/prod/prod.log" || true
-
-# 8. Services and Cron
-a2enmod rewrite
-service apache2 restart
-
-CRON_SUITECRM=/etc/cron.d/suitecrm
-# Run every minute as recommended by SuiteCRM docs
-echo "* * * * * www-data cd $WEBROOT && /usr/bin/php -f cron.php > /dev/null 2>&1" > "$CRON_SUITECRM"
-
-# Stop services for clean image state (standard for TurnKey build scripts)
 service apache2 stop
 service mysql stop
-
-echo "SuiteCRM 8.9.2 installation complete. DocumentRoot points to $WEBROOT/public."
